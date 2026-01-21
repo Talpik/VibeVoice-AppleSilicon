@@ -48,10 +48,11 @@ STABILITY_PRESETS = {
     },
     "Creative": {
         "do_sample": True,
-        "cfg_scale": 4.0,
-        "temperature": 0.85,
+        "cfg_scale": 3.0,
+        "temperature": 0.8,
         "top_p": 0.8,
-        "repetition_penalty": 1.2,
+        "top_k": 50,
+        "repetition_penalty": 1.1,
     },
 }
 
@@ -607,6 +608,7 @@ class VibeVoiceDemo:
             do_sample = preset_config.get("do_sample", True)
             temperature = preset_config.get("temperature", 0.95)
             top_p = preset_config.get("top_p", 0.85)
+            top_k = preset_config.get("top_k", None)
             repetition_penalty = preset_config.get("repetition_penalty", 1.0)
             preset_cfg_scale = preset_config.get("cfg_scale", cfg_scale)
 
@@ -638,6 +640,7 @@ class VibeVoiceDemo:
                     'do_sample': do_sample,
                     'temperature': temperature,
                     'top_p': top_p,
+                    'top_k': top_k,
                     'repetition_penalty': repetition_penalty,
                 },
                 generator=generator,
@@ -968,6 +971,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 preset_cfg = preset.get("cfg_scale", 1.3)
                 preset_temp = preset.get("temperature", 0.95)
                 preset_top_p = preset.get("top_p", 0.85)
+                preset_top_k = preset.get("top_k", None)
                 preset_do_sample = preset.get("do_sample", True)
                 preset_rep_penalty = preset.get("repetition_penalty", None)
 
@@ -977,6 +981,10 @@ Or paste text directly and it will auto-assign speakers.""",
                 **{selected_preset} Preset**
                 - Do Sample: {sampling_mode}
                 - CFG Scale: {preset_cfg} | Temperature: {preset_temp} | Top-p: {preset_top_p}"""
+
+                # Add top_k if present
+                if preset_top_k is not None:
+                    info_text += f" | Top-k: {preset_top_k}"
 
                 # Add repetition penalty if present
                 if preset_rep_penalty is not None:
@@ -989,7 +997,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 elif selected_preset == "Natural":
                     info_text += "Balanced natural-sounding dialogue"
                 elif selected_preset == "Creative":
-                    info_text += "Diverse, creative, and expressive output (reduced hallucinations)"
+                    info_text += "Diverse, creative output with stable tempo (no rushing at the end)"
                 else:
                     info_text += "Custom configuration"
 
