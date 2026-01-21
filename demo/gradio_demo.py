@@ -603,12 +603,9 @@ class VibeVoiceDemo:
 
             # Apply per-run DDPM steps
             try:
-                # Check if preset has inference_steps override
-                preset_inference_steps = preset_config.get("inference_steps", None)
-                steps_to_use = preset_inference_steps if preset_inference_steps is not None else inference_steps
-                self.model.set_ddpm_inference_steps(num_steps=int(steps_to_use))
-                if preset_inference_steps is not None:
-                    print(f"Using inference steps from preset: {steps_to_use}")
+                # Always use the current inference_steps value from the slider
+                # This allows users to manually adjust it after selecting a preset
+                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
             except Exception as e:
                 print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
 
@@ -621,11 +618,10 @@ class VibeVoiceDemo:
             top_k = preset_config.get("top_k", None) if do_sample else None
             # repetition_penalty should only be used if defined in preset (Natural, Creative)
             repetition_penalty = preset_config.get("repetition_penalty", None)
-            preset_cfg_scale = preset_config.get("cfg_scale", cfg_scale)
-            preset_inference_steps = preset_config.get("inference_steps", None)
 
-            # Use preset cfg_scale if available, otherwise use the passed parameter
-            final_cfg_scale = preset_cfg_scale if "cfg_scale" in preset_config else cfg_scale
+            # Always use the current slider values from UI
+            # This allows users to manually adjust them after selecting a preset
+            final_cfg_scale = cfg_scale
 
             # Define a stop check function that can be called from generate
             def check_stop_generation():
