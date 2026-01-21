@@ -39,20 +39,23 @@ STABILITY_PRESETS = {
         "do_sample": False,
         "cfg_scale": 1.5,
         "temperature": 1.0,
+        "inference_steps": 15,
     },
     "Natural": {
         "do_sample": True,
         "cfg_scale": 2.5,
         "temperature": 0.7,
         "top_p": 0.9,
+        "inference_steps": 25,
     },
     "Creative": {
         "do_sample": True,
-        "cfg_scale": 3.0,
-        "temperature": 0.8,
-        "top_p": 0.8,
-        "top_k": 50,
+        "cfg_scale": 4.0,
+        "temperature": 0.75,
+        "top_p": 0.7,
+        "top_k": 20,
         "repetition_penalty": 1.1,
+        "inference_steps": 40,
     },
 }
 
@@ -589,13 +592,7 @@ class VibeVoiceDemo:
                 audio_streamer.end()
                 return
 
-            # Apply per-run DDPM steps
-            try:
-                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
-            except Exception as e:
-                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
-
-            # Apply stability preset settings
+            # Apply stability preset settings FIRST (before using preset_config)
             preset_config = {}
             if stability_preset in STABILITY_PRESETS:
                 preset_config = STABILITY_PRESETS[stability_preset].copy()
@@ -604,6 +601,18 @@ class VibeVoiceDemo:
             else:
                 print(f"Warning: Unknown preset '{stability_preset}'. Using default settings.")
 
+            # Apply per-run DDPM steps
+            try:
+                # Check if preset has inference_steps override
+                preset_inference_steps = preset_config.get("inference_steps", None)
+                steps_to_use = preset_inference_steps if preset_inference_steps is not None else inference_steps
+                self.model.set_ddpm_inference_steps(num_steps=int(steps_to_use))
+                if preset_inference_steps is not None:
+                    print(f"Using inference steps from preset: {steps_to_use}")
+            except Exception as e:
+                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
+
+
             # Extract preset values (or use passed values as fallback)
             do_sample = preset_config.get("do_sample", True)
             temperature = preset_config.get("temperature", 0.95)
@@ -611,6 +620,7 @@ class VibeVoiceDemo:
             top_k = preset_config.get("top_k", None)
             repetition_penalty = preset_config.get("repetition_penalty", 1.0)
             preset_cfg_scale = preset_config.get("cfg_scale", cfg_scale)
+            preset_inference_steps = preset_config.get("inference_steps", None)
 
             # Use preset cfg_scale if available, otherwise use the passed parameter
             final_cfg_scale = preset_cfg_scale if "cfg_scale" in preset_config else cfg_scale
@@ -963,7 +973,7 @@ Or paste text directly and it will auto-assign speakers.""",
         
         # Function to update Advanced Settings based on selected preset
         def update_settings_from_preset(selected_preset):
-            """Update cfg_scale, temperature, etc. based on selected preset."""
+            """Update cfg_scale, inference_steps, temperature, etc. based on selected preset."""
             if selected_preset in STABILITY_PRESETS:
                 preset = STABILITY_PRESETS[selected_preset]
 
@@ -974,6 +984,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 preset_top_k = preset.get("top_k", None)
                 preset_do_sample = preset.get("do_sample", True)
                 preset_rep_penalty = preset.get("repetition_penalty", None)
+                preset_steps = preset.get("inference_steps", None)
 
                 # Create info text
                 sampling_mode = "Sampling" if preset_do_sample else "Deterministic (no sampling)"
@@ -981,6 +992,10 @@ Or paste text directly and it will auto-assign speakers.""",
                 **{selected_preset} Preset**
                 - Do Sample: {sampling_mode}
                 - CFG Scale: {preset_cfg} | Temperature: {preset_temp} | Top-p: {preset_top_p}"""
+
+                # Add inference steps if present
+                if preset_steps is not None:
+                    info_text += f" | Steps: {preset_steps}"
 
                 # Add top_k if present
                 if preset_top_k is not None:
@@ -993,25 +1008,30 @@ Or paste text directly and it will auto-assign speakers.""",
                 info_text += "\n                - Best for: "
 
                 if selected_preset == "Robust":
-                    info_text += "Consistent, predictable output with minimal variation"
+                    info_text += "Fast & clear output (15 steps, low CFG). Ideal for real-time processing"
                 elif selected_preset == "Natural":
-                    info_text += "Balanced natural-sounding dialogue"
+                    info_text += "Balanced quality (25 steps, medium CFG). Best for most podcasts"
                 elif selected_preset == "Creative":
-                    info_text += "Diverse, creative output with stable tempo (no rushing at the end)"
+                    info_text += "Maximum detail (40 steps, high CFG). For professional audio"
                 else:
                     info_text += "Custom configuration"
 
-                # Return updates for cfg_scale slider and preset info
-                return gr.update(value=preset_cfg), gr.update(value=info_text)
+                # Return updates for cfg_scale, inference_steps sliders and preset info
+                steps_value = preset_steps if preset_steps is not None else 10
+                return (
+                    gr.update(value=preset_cfg),           # cfg_scale slider
+                    gr.update(value=steps_value),          # inference_steps slider
+                    gr.update(value=info_text)             # preset info display
+                )
 
             # If preset not found, return current value unchanged
-            return gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update()
 
-        # Connect preset dropdown to update cfg_scale slider and info display
+        # Connect preset dropdown to update cfg_scale, inference_steps sliders and info display
         stability_preset.change(
             fn=update_settings_from_preset,
             inputs=[stability_preset],
-            outputs=[cfg_scale, preset_info_display]
+            outputs=[cfg_scale, inference_steps, preset_info_display]
         )
 
         # Main generation function with streaming
