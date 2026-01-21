@@ -52,10 +52,10 @@ STABILITY_PRESETS = {
         "do_sample": True,
         "cfg_scale": 4.0,
         "temperature": 0.75,
-        "top_p": 0.7,
-        "top_k": 20,
-        "repetition_penalty": 1.1,
-        "inference_steps": 40,
+        "top_p": 0.8,
+        "top_k": 30,
+        "repetition_penalty": 1.05,
+        "inference_steps": 35,
     },
 }
 
