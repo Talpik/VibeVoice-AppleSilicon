@@ -596,32 +596,26 @@ class VibeVoiceDemo:
             preset_config = {}
             if stability_preset in STABILITY_PRESETS:
                 preset_config = STABILITY_PRESETS[stability_preset].copy()
-                print(f"Applying stability preset: {stability_preset}")
-                print(f"Preset config: {preset_config}")
-            else:
-                print(f"Warning: Unknown preset '{stability_preset}'. Using default settings.")
+
+            # UI sliders are the source of truth - override preset_config with slider values
+            preset_config['cfg_scale'] = cfg_scale
+            preset_config['inference_steps'] = inference_steps
+
+            print(f"Using config: {preset_config}")
 
             # Apply per-run DDPM steps
             try:
-                # Always use the current inference_steps value from the slider
-                # This allows users to manually adjust it after selecting a preset
-                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
+                self.model.set_ddpm_inference_steps(num_steps=int(preset_config['inference_steps']))
             except Exception as e:
-                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
+                print(f"Warning: failed to set inference steps: {e}")
 
-
-            # Extract preset values (or use passed values as fallback)
+            # Extract preset values
             do_sample = preset_config.get("do_sample", True)
-            # Only use sampling parameters if do_sample is True
             temperature = preset_config.get("temperature", 0.95) if do_sample else 1.0
             top_p = preset_config.get("top_p", None) if do_sample else None
             top_k = preset_config.get("top_k", None) if do_sample else None
-            # repetition_penalty should only be used if defined in preset (Natural, Creative)
             repetition_penalty = preset_config.get("repetition_penalty", None)
-
-            # Always use the current slider values from UI
-            # This allows users to manually adjust them after selecting a preset
-            final_cfg_scale = cfg_scale
+            final_cfg_scale = preset_config['cfg_scale']
 
             # Define a stop check function that can be called from generate
             def check_stop_generation():
@@ -659,6 +653,7 @@ class VibeVoiceDemo:
                 # Add top_k only if do_sample is True and value is not None
                 if top_k is not None:
                     generation_config['top_k'] = top_k
+
 
             outputs = self.model.generate(
                 **inputs,
@@ -1004,18 +999,25 @@ Or paste text directly and it will auto-assign speakers.""",
                 info_text = f"""
                 **{selected_preset} Preset**
                 - Do Sample: {sampling_mode}
-                - CFG Scale: {preset_cfg} | Temperature: {preset_temp} | Top-p: {preset_top_p}"""
+                - CFG Scale: {preset_cfg}"""
+
+                # Add sampling parameters only if do_sample is True
+                if preset_do_sample:
+                    if preset_temp is not None:
+                        info_text += f" | Temperature: {preset_temp}"
+                    if preset_top_p is not None:
+                        info_text += f" | Top-p: {preset_top_p}"
 
                 # Add inference steps if present
                 if preset_steps is not None:
                     info_text += f" | Steps: {preset_steps}"
 
-                # Add top_k if present
-                if preset_top_k is not None:
+                # Add top_k if present (only for sampling presets)
+                if preset_do_sample and preset_top_k is not None:
                     info_text += f" | Top-k: {preset_top_k}"
 
-                # Add repetition penalty if present
-                if preset_rep_penalty is not None:
+                # Add repetition penalty if present (only for sampling presets)
+                if preset_do_sample and preset_rep_penalty is not None:
                     info_text += f" | Rep. Penalty: {preset_rep_penalty}"
 
                 info_text += "\n                - Best for: "
