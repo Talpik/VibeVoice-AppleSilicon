@@ -33,6 +33,29 @@ logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
 
+# Stability Presets Dictionary
+STABILITY_PRESETS = {
+    "Robust": {
+        "do_sample": False,
+        "cfg_scale": 1.5,
+        "temperature": 1.0,
+    },
+    "Natural": {
+        "do_sample": True,
+        "cfg_scale": 2.5,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    },
+    "Creative": {
+        "do_sample": True,
+        "cfg_scale": 4.0,
+        "temperature": 0.85,
+        "top_p": 0.8,
+        "repetition_penalty": 1.2,
+    },
+}
+
+
 class VibeVoiceDemo:
     def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5, adapter_path: Optional[str] = None):
         """Initialize the VibeVoice demo with model loading."""
@@ -64,8 +87,8 @@ class VibeVoiceDemo:
         self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
         # Decide dtype & attention
         if self.device == "mps":
-            load_dtype = torch.float32
-            attn_impl_primary = "sdpa"
+            load_dtype = torch.bfloat16
+            attn_impl_primary = "eager"  # SPDA has bugs on MPS
         elif self.device == "cuda":
             load_dtype = torch.bfloat16
             attn_impl_primary = "flash_attention_2"
@@ -213,7 +236,8 @@ class VibeVoiceDemo:
                                  cfg_scale: float = 1.3,
                                  inference_steps: Optional[int] = None,
                                  seed: Optional[int] = None,
-                                 disable_voice_cloning: bool = False) -> Iterator[tuple]:
+                                 disable_voice_cloning: bool = False,
+                                 stability_preset: str = "Natural") -> Iterator[tuple]:
         try:
             
             # Reset stop flag and set generating state
@@ -362,7 +386,7 @@ class VibeVoiceDemo:
             # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device)
+                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device, stability_preset)
             )
             generation_thread.start()
             
@@ -555,6 +579,7 @@ class VibeVoiceDemo:
         inference_steps: int,
         seed: Optional[int],
         target_device: str,
+        stability_preset: str = "Natural",
     ):
         """Helper method to run generation with streamer in a separate thread."""
         try:
@@ -568,7 +593,26 @@ class VibeVoiceDemo:
                 self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
             except Exception as e:
                 print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
-                
+
+            # Apply stability preset settings
+            preset_config = {}
+            if stability_preset in STABILITY_PRESETS:
+                preset_config = STABILITY_PRESETS[stability_preset].copy()
+                print(f"Applying stability preset: {stability_preset}")
+                print(f"Preset config: {preset_config}")
+            else:
+                print(f"Warning: Unknown preset '{stability_preset}'. Using default settings.")
+
+            # Extract preset values (or use passed values as fallback)
+            do_sample = preset_config.get("do_sample", True)
+            temperature = preset_config.get("temperature", 0.95)
+            top_p = preset_config.get("top_p", 0.85)
+            repetition_penalty = preset_config.get("repetition_penalty", 1.0)
+            preset_cfg_scale = preset_config.get("cfg_scale", cfg_scale)
+
+            # Use preset cfg_scale if available, otherwise use the passed parameter
+            final_cfg_scale = preset_cfg_scale if "cfg_scale" in preset_config else cfg_scale
+
             # Define a stop check function that can be called from generate
             def check_stop_generation():
                 return self.stop_generation
@@ -588,10 +632,13 @@ class VibeVoiceDemo:
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=None,
-                cfg_scale=cfg_scale,
+                cfg_scale=final_cfg_scale,
                 tokenizer=self.processor.tokenizer,
                 generation_config={
-                    'do_sample': False,
+                    'do_sample': do_sample,
+                    'temperature': temperature,
+                    'top_p': top_p,
+                    'repetition_penalty': repetition_penalty,
                 },
                 generator=generator,
                 audio_streamer=audio_streamer,
@@ -741,6 +788,27 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                     )
                     speaker_selections.append(speaker)
                 
+                # Stability Presets
+                gr.Markdown("### 🎚️ **Stability Presets**")
+
+                stability_preset = gr.Dropdown(
+                    choices=list(STABILITY_PRESETS.keys()),
+                    value="Natural",
+                    label="Stability Presets",
+                    info="Choose a preset: Robust (consistent), Natural (balanced), or Creative (varied)",
+                    elem_classes="preset-selector"
+                )
+
+                # Preset info display
+                preset_info_display = gr.Markdown(
+                    value="""
+                    **Natural Preset (default)**
+                    - CFG Scale: 2.5 | Temperature: 0.7 | Top-p: 0.9
+                    - Best for: Balanced and natural-sounding dialogue
+                    """,
+                    visible=True
+                )
+
                 # Advanced settings
                 gr.Markdown("### ⚙️ **Advanced Settings**")
                 
@@ -890,8 +958,56 @@ Or paste text directly and it will auto-assign speakers.""",
             outputs=speaker_selections
         )
         
+        # Function to update Advanced Settings based on selected preset
+        def update_settings_from_preset(selected_preset):
+            """Update cfg_scale, temperature, etc. based on selected preset."""
+            if selected_preset in STABILITY_PRESETS:
+                preset = STABILITY_PRESETS[selected_preset]
+
+                # Get preset values
+                preset_cfg = preset.get("cfg_scale", 1.3)
+                preset_temp = preset.get("temperature", 0.95)
+                preset_top_p = preset.get("top_p", 0.85)
+                preset_do_sample = preset.get("do_sample", True)
+                preset_rep_penalty = preset.get("repetition_penalty", None)
+
+                # Create info text
+                sampling_mode = "Sampling" if preset_do_sample else "Deterministic (no sampling)"
+                info_text = f"""
+                **{selected_preset} Preset**
+                - Do Sample: {sampling_mode}
+                - CFG Scale: {preset_cfg} | Temperature: {preset_temp} | Top-p: {preset_top_p}"""
+
+                # Add repetition penalty if present
+                if preset_rep_penalty is not None:
+                    info_text += f" | Rep. Penalty: {preset_rep_penalty}"
+
+                info_text += "\n                - Best for: "
+
+                if selected_preset == "Robust":
+                    info_text += "Consistent, predictable output with minimal variation"
+                elif selected_preset == "Natural":
+                    info_text += "Balanced natural-sounding dialogue"
+                elif selected_preset == "Creative":
+                    info_text += "Diverse, creative, and expressive output (reduced hallucinations)"
+                else:
+                    info_text += "Custom configuration"
+
+                # Return updates for cfg_scale slider and preset info
+                return gr.update(value=preset_cfg), gr.update(value=info_text)
+
+            # If preset not found, return current value unchanged
+            return gr.update(), gr.update()
+
+        # Connect preset dropdown to update cfg_scale slider and info display
+        stability_preset.change(
+            fn=update_settings_from_preset,
+            inputs=[stability_preset],
+            outputs=[cfg_scale, preset_info_display]
+        )
+
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, stability_preset, cfg_scale, inference_steps, seed, disable_voice_cloning):
             """Wrapper function to handle the streaming generation call."""
             try:
                 speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
@@ -912,7 +1028,8 @@ Or paste text directly and it will auto-assign speakers.""",
                     cfg_scale=cfg_scale,
                     inference_steps=inference_steps,
                     seed=seed,
-                    disable_voice_cloning=disable_voice_cloning
+                    disable_voice_cloning=disable_voice_cloning,
+                    stability_preset=stability_preset
                 ):
                     final_log = log
                     
@@ -960,7 +1077,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
+            inputs=[num_speakers, script_input] + speaker_selections + [stability_preset, cfg_scale, inference_steps, seed, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
@@ -1066,7 +1183,7 @@ def convert_to_16_bit_wav(data):
     # Normalize to range [-1, 1] if it's not already
     if np.max(np.abs(data)) > 1.0:
         data = data / np.max(np.abs(data))
-    
+
     # Scale to 16-bit integer range
     data = (data * 32767).astype(np.int16)
     return data
