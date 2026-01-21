@@ -38,7 +38,6 @@ STABILITY_PRESETS = {
     "Robust": {
         "do_sample": False,
         "cfg_scale": 1.5,
-        "temperature": 1.0,
         "inference_steps": 15,
     },
     "Natural": {
@@ -46,6 +45,7 @@ STABILITY_PRESETS = {
         "cfg_scale": 2.5,
         "temperature": 0.7,
         "top_p": 0.9,
+        "repetition_penalty": 1.05,
         "inference_steps": 25,
     },
     "Creative": {
@@ -615,10 +615,12 @@ class VibeVoiceDemo:
 
             # Extract preset values (or use passed values as fallback)
             do_sample = preset_config.get("do_sample", True)
-            temperature = preset_config.get("temperature", 0.95)
-            top_p = preset_config.get("top_p", 0.85)
-            top_k = preset_config.get("top_k", None)
-            repetition_penalty = preset_config.get("repetition_penalty", 1.0)
+            # Only use sampling parameters if do_sample is True
+            temperature = preset_config.get("temperature", 0.95) if do_sample else 1.0
+            top_p = preset_config.get("top_p", None) if do_sample else None
+            top_k = preset_config.get("top_k", None) if do_sample else None
+            # repetition_penalty should only be used if defined in preset (Natural, Creative)
+            repetition_penalty = preset_config.get("repetition_penalty", None)
             preset_cfg_scale = preset_config.get("cfg_scale", cfg_scale)
             preset_inference_steps = preset_config.get("inference_steps", None)
 
@@ -641,18 +643,33 @@ class VibeVoiceDemo:
                     print(f"Warning: failed to create seeded generator (seed={seed}, device={target_device}): {e}")
                     generator = None
                 
+            # Build generation_config dynamically - only add keys when needed
+            generation_config = {
+                'do_sample': do_sample,
+            }
+
+            # Add repetition_penalty only if it's defined in preset (Natural, Creative)
+            if repetition_penalty is not None:
+                generation_config['repetition_penalty'] = repetition_penalty
+
+            # Add temperature only if do_sample is True
+            if do_sample:
+                generation_config['temperature'] = temperature
+
+                # Add top_p only if do_sample is True and value is not None
+                if top_p is not None:
+                    generation_config['top_p'] = top_p
+
+                # Add top_k only if do_sample is True and value is not None
+                if top_k is not None:
+                    generation_config['top_k'] = top_k
+
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=None,
                 cfg_scale=final_cfg_scale,
                 tokenizer=self.processor.tokenizer,
-                generation_config={
-                    'do_sample': do_sample,
-                    'temperature': temperature,
-                    'top_p': top_p,
-                    'top_k': top_k,
-                    'repetition_penalty': repetition_penalty,
-                },
+                generation_config=generation_config,
                 generator=generator,
                 audio_streamer=audio_streamer,
                 stop_check_fn=check_stop_generation,  # Pass the stop check function
@@ -1008,7 +1025,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 info_text += "\n                - Best for: "
 
                 if selected_preset == "Robust":
-                    info_text += "Fast & clear output (15 steps, low CFG). Ideal for real-time processing"
+                    info_text += "Deterministic output (15 steps, no sampling). Ideal for consistency & real-time"
                 elif selected_preset == "Natural":
                     info_text += "Balanced quality (25 steps, medium CFG). Best for most podcasts"
                 elif selected_preset == "Creative":
