@@ -50,11 +50,11 @@ STABILITY_PRESETS = {
     },
     "Creative": {
         "do_sample": True,
-        "cfg_scale": 4.0,
-        "temperature": 0.75,
-        "top_p": 0.8,
-        "top_k": 30,
-        "repetition_penalty": 1.05,
+        "cfg_scale": 3.0,
+        "temperature": 0.70,
+        "top_p": 0.7,
+        "top_k": 15,
+        "repetition_penalty": 1.15,
         "inference_steps": 35,
     },
 }
