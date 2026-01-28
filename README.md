@@ -68,6 +68,63 @@ cd VibeVoice/
 uv pip install -e .
 ```
 
+---
+
+## macOS (Apple Silicon) installation 🍏
+
+Follow these exact steps to reproduce a working Apple Silicon setup (uses the `uv` CLI as requested):
+
+1. Install / upgrade `uv` and `pip`:
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install -U uv
+```
+
+2. Clone the repo (either the community repo or your fork) and change into it:
+
+```bash
+# community repo
+git clone https://github.com/vibevoice-community/VibeVoice.git
+# or your fork
+# git clone https://github.com/Talpik/VibeVoice-AppleSilicon.git
+cd VibeVoice/
+```
+
+3. Create and activate a virtual environment with `uv` (Python 3.12):
+
+```bash
+uv venv --python 3.12
+# activate
+source .venv/bin/activate
+```
+
+4. Install pinned dependencies from the Apple Silicon requirements file using `uv pip` (recommended to ensure the correct environment/interpreter):
+
+```bash
+uv pip install -r requirements-apple-silicon.txt
+```
+
+5. Download the VibeVoice-7B model into the project `models/` folder using the Hugging Face CLI (run via `uv`):
+
+```bash
+# using HF "hf" CLI
+uv run hf repo clone vibevoice/VibeVoice-7B ./models/VibeVoice-7B
+# alternative executable name (hf-cli/huggingface-cli) may exist on some systems
+# uv run hf-cli repo clone vibevoice/VibeVoice-7B ./models/VibeVoice-7B
+```
+
+6. Run the Gradio demo with recommended environment variables for MPS fallback:
+
+```bash
+PYTHONPATH=. PYTORCH_ENABLE_MPS_FALLBACK=1 TOKENIZERS_PARALLELISM=false \
+  uv run python demo/gradio_demo.py --model_path ./models/VibeVoice-7B
+```
+
+7. Open the UI in your browser at the URL printed in the terminal (usually http://127.0.0.1:7860). Use `--share` to get a public link if needed.
+
+---
+
 ## Usage
 
 ### 🚨 Tips
