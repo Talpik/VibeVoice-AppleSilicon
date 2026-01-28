@@ -20,6 +20,7 @@ import torch
 import os
 import traceback
 import re
+import subprocess
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
@@ -31,6 +32,33 @@ from transformers import set_seed
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
+
+
+# Stability Presets Dictionary
+STABILITY_PRESETS = {
+    "Robust": {
+        "do_sample": False,
+        "cfg_scale": 1.5,
+        "inference_steps": 15,
+    },
+    "Natural": {
+        "do_sample": True,
+        "cfg_scale": 2.5,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repetition_penalty": 1.05,
+        "inference_steps": 25,
+    },
+    "Creative": {
+        "do_sample": True,
+        "cfg_scale": 3.0,
+        "temperature": 0.70,
+        "top_p": 0.7,
+        "top_k": 15,
+        "repetition_penalty": 1.15,
+        "inference_steps": 35,
+    },
+}
 
 
 class VibeVoiceDemo:
@@ -64,8 +92,8 @@ class VibeVoiceDemo:
         self.processor = VibeVoiceProcessor.from_pretrained(self.model_path)
         # Decide dtype & attention
         if self.device == "mps":
-            load_dtype = torch.float32
-            attn_impl_primary = "sdpa"
+            load_dtype = torch.bfloat16
+            attn_impl_primary = "eager"  # SPDA has bugs on MPS
         elif self.device == "cuda":
             load_dtype = torch.bfloat16
             attn_impl_primary = "flash_attention_2"
@@ -213,7 +241,8 @@ class VibeVoiceDemo:
                                  cfg_scale: float = 1.3,
                                  inference_steps: Optional[int] = None,
                                  seed: Optional[int] = None,
-                                 disable_voice_cloning: bool = False) -> Iterator[tuple]:
+                                 disable_voice_cloning: bool = False,
+                                 stability_preset: str = "Natural") -> Iterator[tuple]:
         try:
             
             # Reset stop flag and set generating state
@@ -362,7 +391,7 @@ class VibeVoiceDemo:
             # Start generation in a separate thread
             generation_thread = threading.Thread(
                 target=self._generate_with_streamer,
-                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device)
+                args=(inputs, cfg_scale, audio_streamer, voice_cloning_enabled, resolved_inference_steps, resolved_seed, target_device, stability_preset)
             )
             generation_thread.start()
             
@@ -555,6 +584,7 @@ class VibeVoiceDemo:
         inference_steps: int,
         seed: Optional[int],
         target_device: str,
+        stability_preset: str = "Natural",
     ):
         """Helper method to run generation with streamer in a separate thread."""
         try:
@@ -563,12 +593,31 @@ class VibeVoiceDemo:
                 audio_streamer.end()
                 return
 
+            # Apply stability preset settings FIRST (before using preset_config)
+            preset_config = {}
+            if stability_preset in STABILITY_PRESETS:
+                preset_config = STABILITY_PRESETS[stability_preset].copy()
+
+            # UI sliders are the source of truth - override preset_config with slider values
+            preset_config['cfg_scale'] = cfg_scale
+            preset_config['inference_steps'] = inference_steps
+
+            print(f"Using config: {preset_config}")
+
             # Apply per-run DDPM steps
             try:
-                self.model.set_ddpm_inference_steps(num_steps=int(inference_steps))
+                self.model.set_ddpm_inference_steps(num_steps=int(preset_config['inference_steps']))
             except Exception as e:
-                print(f"Warning: failed to set inference steps ({inference_steps}): {e}")
-                
+                print(f"Warning: failed to set inference steps: {e}")
+
+            # Extract preset values
+            do_sample = preset_config.get("do_sample", True)
+            temperature = preset_config.get("temperature", 0.95) if do_sample else 1.0
+            top_p = preset_config.get("top_p", None) if do_sample else None
+            top_k = preset_config.get("top_k", None) if do_sample else None
+            repetition_penalty = preset_config.get("repetition_penalty", None)
+            final_cfg_scale = preset_config['cfg_scale']
+
             # Define a stop check function that can be called from generate
             def check_stop_generation():
                 return self.stop_generation
@@ -585,14 +634,34 @@ class VibeVoiceDemo:
                     print(f"Warning: failed to create seeded generator (seed={seed}, device={target_device}): {e}")
                     generator = None
                 
+            # Build generation_config dynamically - only add keys when needed
+            generation_config = {
+                'do_sample': do_sample,
+            }
+
+            # Add repetition_penalty only if it's defined in preset (Natural, Creative)
+            if repetition_penalty is not None:
+                generation_config['repetition_penalty'] = repetition_penalty
+
+            # Add temperature only if do_sample is True
+            if do_sample:
+                generation_config['temperature'] = temperature
+
+                # Add top_p only if do_sample is True and value is not None
+                if top_p is not None:
+                    generation_config['top_p'] = top_p
+
+                # Add top_k only if do_sample is True and value is not None
+                if top_k is not None:
+                    generation_config['top_k'] = top_k
+
+
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=None,
-                cfg_scale=cfg_scale,
+                cfg_scale=final_cfg_scale,
                 tokenizer=self.processor.tokenizer,
-                generation_config={
-                    'do_sample': False,
-                },
+                generation_config=generation_config,
                 generator=generator,
                 audio_streamer=audio_streamer,
                 stop_check_fn=check_stop_generation,  # Pass the stop check function
@@ -606,6 +675,293 @@ class VibeVoiceDemo:
             traceback.print_exc()
             # Make sure to end the stream on error
             audio_streamer.end()
+    
+    def generate_podcast_batched(
+        self,
+        num_speakers: int,
+        script: str,
+        speaker_1: str = None,
+        speaker_2: str = None,
+        speaker_3: str = None,
+        speaker_4: str = None,
+        cfg_scale: float = 1.3,
+        inference_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        disable_voice_cloning: bool = False,
+        stability_preset: str = "Natural",
+    ) -> (str, str):
+        """Batch multiple script turns into a single generation call and return WAV path and log.
+
+        This is a non-streaming, simpler path that batches each script line as a separate
+        entry to the model, collects `speech_outputs` and concatenates them with 150ms
+        silence between chunks.
+        """
+        # Basic validation (reuse some logic from streaming version)
+        if not script.strip():
+            raise gr.Error("Error: Please provide a script.")
+
+        if num_speakers < 1 or num_speakers > 4:
+            raise gr.Error("Error: Number of speakers must be between 1 and 4.")
+
+        selected_speakers = [speaker_1, speaker_2, speaker_3, speaker_4][:num_speakers]
+        for i, speaker in enumerate(selected_speakers):
+            if not speaker or speaker not in self.available_voices:
+                raise gr.Error(f"Error: Please select a valid speaker for Speaker {i+1}.")
+
+        voice_cloning_enabled = not disable_voice_cloning
+
+        # Load voice samples when voice cloning is enabled
+        voice_samples = None
+        if voice_cloning_enabled:
+            voice_samples = []
+            for speaker_name in selected_speakers:
+                audio_path = self.available_voices[speaker_name]
+                audio_data = self.read_audio(audio_path)
+                if len(audio_data) == 0:
+                    raise gr.Error(f"Error: Failed to load audio for {speaker_name}")
+                voice_samples.append(audio_data)
+
+        # Build preset config (include advanced settings in logs)
+        preset_config = {}
+        if stability_preset in STABILITY_PRESETS:
+            preset_config = STABILITY_PRESETS[stability_preset].copy()
+        # UI values override preset
+        preset_config['cfg_scale'] = cfg_scale
+        preset_config['inference_steps'] = inference_steps if inference_steps is not None else int(self.inference_steps)
+
+        # Derive readable params summary
+        param_parts = [f"CFG={preset_config.get('cfg_scale', cfg_scale)}", f"Steps={preset_config.get('inference_steps')}"]
+        if preset_config.get('do_sample', False):
+            param_parts.append(f"Temp={preset_config.get('temperature', 'n/a')}")
+            if 'top_p' in preset_config:
+                param_parts.append(f"Top-p={preset_config.get('top_p')}")
+            if 'top_k' in preset_config:
+                param_parts.append(f"Top-k={preset_config.get('top_k')}")
+            if 'repetition_penalty' in preset_config:
+                param_parts.append(f"RepPenalty={preset_config.get('repetition_penalty')}")
+        param_parts.append(f"DoSample={preset_config.get('do_sample', False)}")
+        param_parts.append(f"VoiceCloning={'On' if voice_cloning_enabled else 'Off'}")
+        if self.loaded_adapter_root:
+            param_parts.append(f"LoRA={self.loaded_adapter_root}")
+        params_summary = ", ".join(param_parts)
+
+        # Log the params for debugging
+        logger.info(f"Batched generation params: {params_summary}")
+
+        # Parse script to assign speaker IDs per line
+        lines = script.strip().split('\n')
+        formatted_script_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('Speaker ') and ':' in line:
+                formatted_script_lines.append(line)
+            else:
+                speaker_id = len(formatted_script_lines) % num_speakers
+                formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
+
+        if not formatted_script_lines:
+            raise gr.Error("Error: No valid script lines to synthesize.")
+
+        # Adaptive batching: split by sentence-ending punctuation and group into
+        # a small number of batches depending on total text length.
+        # Build sentence-level pieces preserving speaker tags.
+        sentence_items: List[tuple] = []  # list of (speaker_id, sentence_text)
+        sentence_split_re = re.compile(r'(?<=[\.\!\?;])\s+')
+        for line in formatted_script_lines:
+            m = re.match(r'^(Speaker\s+(\d+)\s*:\s*)(.*)$', line)
+            if m:
+                prefix = m.group(1)
+                sid = int(m.group(2))
+                content = m.group(3).strip()
+            else:
+                # fallback: assign to speaker 0
+                prefix = "Speaker 0: "
+                sid = 0
+                content = line
+
+            # split content into sentences by punctuation
+            parts = [p.strip() for p in sentence_split_re.split(content) if p.strip()]
+            if not parts:
+                parts = [content]
+            for p in parts:
+                # Store raw sentence text; do NOT include the per-sentence speaker prefix.
+                # We'll prefix each batch once later to avoid introducing extra pauses.
+                sentence_items.append((sid, p))
+
+        if not sentence_items:
+            raise gr.Error("Error: No valid sentences to synthesize.")
+
+        total_chars = sum(len(s) for _, s in sentence_items)
+
+        # Determine number of batches using conservative heuristics to avoid
+        # generating too many small chunks (larger batch counts can degrade speed):
+        # - <=1000 chars -> 2 batches
+        # - 1001..2500 chars -> 3 batches
+        # - >=2501 chars -> 4 batches
+        if total_chars <= 1000:
+            num_batches = 2
+        elif total_chars <= 2500:
+            num_batches = 3
+        else:
+            num_batches = 4
+
+        # Greedily group sentences into num_batches trying to balance character counts
+        target_per_batch = max(1, total_chars // num_batches)
+        batches: List[str] = []
+        batch_voice_map: List[int] = []  # speaker id to use for this batch (first sentence)
+
+        cur_parts: List[str] = []
+        cur_chars = 0
+        idx = 0
+        for sid, sent in sentence_items:
+            if not cur_parts:
+                # start new batch, remember speaker for this batch
+                batch_voice_map.append(sid)
+            cur_parts.append(sent)
+            cur_chars += len(sent)
+            sentences_left = len(sentence_items) - (idx + 1)
+            # Decide to cut batch if we've reached target and still have batches left
+            if (cur_chars >= target_per_batch and len(batches) < num_batches - 1) or (sentences_left + len(batches) + 1) <= (num_batches - len(batches)):
+                batches.append("\n".join(cur_parts))
+                cur_parts = []
+                cur_chars = 0
+            idx += 1
+
+        if cur_parts:
+            batches.append("\n".join(cur_parts))
+
+        # Ensure we have at least 1 batch
+        if not batches:
+            batches = ["\n".join([s for _, s in sentence_items])]
+
+        # Attach a single speaker prefix per batch (avoid per-sentence speaker tags)
+        prefixed_texts: List[str] = []
+        for i, batch in enumerate(batches):
+            sid_for_batch = batch_voice_map[i] if i < len(batch_voice_map) else 0
+            # join sentences in the batch with spaces to form a natural paragraph
+            batch_body = " ".join(s.strip() for s in batch.split('\n') if s.strip())
+            prefixed_texts.append(f"Speaker {sid_for_batch}: {batch_body}")
+
+        texts = prefixed_texts
+
+        # Log each batch text to terminal and to a marker file for offline analysis
+        try:
+            batches_marker = os.path.join(tempfile.gettempdir(), "vibevoice_last_batched_batches.txt")
+            with open(batches_marker, 'w', encoding='utf-8') as bm:
+                bm.write(f"Batched generation at {datetime.now().isoformat()}\n")
+                for i, b in enumerate(texts):
+                    header = f"--- Batch {i+1}/{len(texts)} (chars={len(b)}) ---\n"
+                    logger.info(header + b)
+                    print(header + b, flush=True)
+                    bm.write(header)
+                    bm.write(b + "\n\n")
+            logger.info(f"Wrote batched texts to {batches_marker}")
+        except Exception:
+            pass
+
+        # Prepare per-chunk voice samples: use the first sentence's speaker sample for each batch
+        per_chunk_voice_samples = None
+        if voice_samples is not None:
+            per_chunk_voice_samples = []
+            for i, batch_text in enumerate(texts):
+                # pick speaker id: if we recorded one earlier, use it, else fallback to 0
+                sid_for_batch = batch_voice_map[i] if i < len(batch_voice_map) else 0
+                sid_idx = min(sid_for_batch, len(voice_samples) - 1)
+                per_chunk_voice_samples.append([voice_samples[sid_idx]])
+
+        processor_kwargs = {
+            "text": texts,
+            "padding": True,
+            "return_tensors": "pt",
+            "return_attention_mask": True,
+        }
+        if per_chunk_voice_samples is not None:
+            processor_kwargs["voice_samples"] = per_chunk_voice_samples
+
+        inputs = self.processor(**processor_kwargs)
+
+        # Move tensors to device
+        target_device = self.device if self.device in ("cuda", "mps") else "cpu"
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(target_device)
+
+        # Print to stdout (safe point: target_device and texts are defined)
+        try:
+            print("Batched generation params:", preset_config, flush=True)
+            print(f"Target device: {target_device}", flush=True)
+            print(f"Chunks to synthesize: {len(texts)}", flush=True)
+        except Exception:
+            pass
+
+        # Seeded generator
+        generator = None
+        if seed is not None:
+            try:
+                if target_device == "cuda":
+                    generator = torch.Generator(device="cuda")
+                else:
+                    generator = torch.Generator()
+                generator.manual_seed(int(seed))
+            except Exception:
+                generator = None
+
+        # Apply inference steps if provided
+        try:
+            self.model.set_ddpm_inference_steps(num_steps=int(inference_steps) if inference_steps is not None else int(self.inference_steps))
+        except Exception:
+            pass
+
+        # Call model.generate for the whole batch and measure time
+        start_time = time.time()
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                cfg_scale=cfg_scale,
+                tokenizer=self.processor.tokenizer,
+                generation_config={"do_sample": False},
+                generator=generator,
+                verbose=False,
+                is_prefill=voice_cloning_enabled,
+            )
+        generation_time = time.time() - start_time
+
+        # Concatenate outputs with 150ms silence between
+        SAMPLE_RATE = 24000
+        silence = torch.zeros(int(SAMPLE_RATE * 0.15))
+        parts = []
+        for speech_output in (outputs.speech_outputs or []):
+            if speech_output is not None:
+                parts.append(speech_output.squeeze().cpu())
+            else:
+                parts.append(torch.zeros(SAMPLE_RATE))
+            parts.append(silence)
+
+        if parts:
+            final_audio = torch.cat(parts[:-1])
+        else:
+            final_audio = torch.zeros(SAMPLE_RATE)
+
+        # Compute duration in seconds
+        final_duration_sec = float(final_audio.shape[-1]) / float(SAMPLE_RATE)
+
+        # Convert to 16-bit PCM and write to temp file
+        final_np = final_audio.numpy()
+        final_int16 = (np.clip(final_np, -1.0, 1.0) * 32767).astype(np.int16)
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        basename = f"{ts}_batched.wav"
+        out_path = os.path.join(tempfile.gettempdir(), basename)
+        sf.write(out_path, final_int16, SAMPLE_RATE, subtype="PCM_16")
+
+        final_log = (
+            f"⏱️ Batched generation completed in {generation_time:.2f}s. "
+            f"Final audio duration: {final_duration_sec:.2f}s. "
+            f"Chunks batched: {len(texts)}. "
+            f"Params: {params_summary}"
+        )
+        return out_path, final_log
     
     def stop_audio_generation(self):
         """Stop the current audio generation process."""
@@ -741,6 +1097,27 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                     )
                     speaker_selections.append(speaker)
                 
+                # Stability Presets
+                gr.Markdown("### 🎚️ **Stability Presets**")
+
+                stability_preset = gr.Dropdown(
+                    choices=list(STABILITY_PRESETS.keys()),
+                    value="Natural",
+                    label="Stability Presets",
+                    info="Choose a preset: Robust (consistent), Natural (balanced), or Creative (varied)",
+                    elem_classes="preset-selector"
+                )
+
+                # Preset info display
+                preset_info_display = gr.Markdown(
+                    value="""
+                    **Natural Preset (default)**
+                    - CFG Scale: 2.5 | Temperature: 0.7 | Top-p: 0.9
+                    - Best for: Balanced and natural-sounding dialogue
+                    """,
+                    visible=True
+                )
+
                 # Advanced settings
                 gr.Markdown("### ⚙️ **Advanced Settings**")
                 
@@ -773,6 +1150,11 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                         label="Disable voice cloning (skip conditioning voice prompts)",
                         info="When enabled, sets is_prefill=False so the model ignores provided speaker audio."
                     )
+                    use_batched_mode = gr.Checkbox(
+                        value=False,
+                        label="Use batched synthesis (non-streaming, faster)",
+                        info="When enabled, the demo will batch multiple script turns into one generation call and return the full audio file."
+                    )
                 
             # Right column - Generation
             with gr.Column(scale=2, elem_classes="generation-card"):
@@ -789,6 +1171,22 @@ Or paste text directly and it will auto-assign speakers.""",
                     lines=12,
                     max_lines=20,
                     elem_classes="script-input"
+                )
+                # Character counter below the script input
+                char_count = gr.Markdown(value="Characters: 0", elem_classes="char-count")
+                
+                # Update character counter when script input changes
+                def update_char_count(text):
+                    try:
+                        count = len(text) if text is not None else 0
+                    except Exception:
+                        count = 0
+                    return gr.update(value=f"Characters: {count}")
+
+                script_input.change(
+                    fn=update_char_count,
+                    inputs=[script_input],
+                    outputs=[char_count]
                 )
                 
                 # Button row with Random Example on the left and Generate on the right
@@ -890,17 +1288,132 @@ Or paste text directly and it will auto-assign speakers.""",
             outputs=speaker_selections
         )
         
+        # Function to update Advanced Settings based on selected preset
+        def update_settings_from_preset(selected_preset):
+            """Update cfg_scale, inference_steps, temperature, etc. based on selected preset."""
+            if selected_preset in STABILITY_PRESETS:
+                preset = STABILITY_PRESETS[selected_preset]
+
+                # Get preset values
+                preset_cfg = preset.get("cfg_scale", 1.3)
+                preset_temp = preset.get("temperature", 0.95)
+                preset_top_p = preset.get("top_p", 0.85)
+                preset_top_k = preset.get("top_k", None)
+                preset_do_sample = preset.get("do_sample", True)
+                preset_rep_penalty = preset.get("repetition_penalty", None)
+                preset_steps = preset.get("inference_steps", None)
+
+                # Create info text
+                sampling_mode = "Sampling" if preset_do_sample else "Deterministic (no sampling)"
+                info_text = f"""
+                **{selected_preset} Preset**
+                - Do Sample: {sampling_mode}
+                - CFG Scale: {preset_cfg}"""
+
+                # Add sampling parameters only if do_sample is True
+                if preset_do_sample:
+                    if preset_temp is not None:
+                        info_text += f" | Temperature: {preset_temp}"
+                    if preset_top_p is not None:
+                        info_text += f" | Top-p: {preset_top_p}"
+
+                # Add inference steps if present
+                if preset_steps is not None:
+                    info_text += f" | Steps: {preset_steps}"
+
+                # Add top_k if present (only for sampling presets)
+                if preset_do_sample and preset_top_k is not None:
+                    info_text += f" | Top-k: {preset_top_k}"
+
+                # Add repetition penalty if present (only for sampling presets)
+                if preset_do_sample and preset_rep_penalty is not None:
+                    info_text += f" | Rep. Penalty: {preset_rep_penalty}"
+
+                info_text += "\n                - Best for: "
+
+                if selected_preset == "Robust":
+                    info_text += "Deterministic output (15 steps, no sampling). Ideal for consistency & real-time"
+                elif selected_preset == "Natural":
+                    info_text += "Balanced quality (25 steps, medium CFG). Best for most podcasts"
+                elif selected_preset == "Creative":
+                    info_text += "Maximum detail (40 steps, high CFG). For professional audio"
+                else:
+                    info_text += "Custom configuration"
+
+                # Return updates for cfg_scale, inference_steps sliders and preset info
+                steps_value = preset_steps if preset_steps is not None else 10
+                return (
+                    gr.update(value=preset_cfg),           # cfg_scale slider
+                    gr.update(value=steps_value),          # inference_steps slider
+                    gr.update(value=info_text)             # preset info display
+                )
+
+            # If preset not found, return current value unchanged
+            return gr.update(), gr.update(), gr.update()
+
+        # Connect preset dropdown to update cfg_scale, inference_steps sliders and info display
+        stability_preset.change(
+            fn=update_settings_from_preset,
+            inputs=[stability_preset],
+            outputs=[cfg_scale, inference_steps, preset_info_display]
+        )
+
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, cfg_scale, inference_steps, seed, disable_voice_cloning):
+        def generate_podcast_wrapper(num_speakers, script, speaker_1, speaker_2, speaker_3, speaker_4, stability_preset, cfg_scale, inference_steps, seed, use_batched_mode, disable_voice_cloning):
             """Wrapper function to handle the streaming generation call."""
             try:
                 speakers = [speaker_1, speaker_2, speaker_3, speaker_4]
 
                 # Clear outputs and reset visibility at start
-                yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+                # Use start_message to indicate batched mode when requested
+                start_message = "🎙️ Starting generation..."
+                if use_batched_mode:
+                    start_message += " 🔀 Batched mode enabled — running non-streaming batched synthesis."
+                yield None, gr.update(value=None, visible=False), start_message, gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
 
                 # The generator will yield multiple times
                 final_log = "Starting generation..."
+
+                # Build start message including batched-mode indicator
+                start_message = "🎙️ Starting generation..."
+                if use_batched_mode:
+                    start_message += " 🔀 Batched mode enabled — running non-streaming batched synthesis."
+
+                # If batched mode requested, use non-streaming batched generation
+                if use_batched_mode:
+                    try:
+                        complete_wav, batched_log = demo_instance.generate_podcast_batched(
+                            num_speakers=int(num_speakers),
+                            script=script,
+                            speaker_1=speakers[0],
+                            speaker_2=speakers[1],
+                            speaker_3=speakers[2],
+                            speaker_4=speakers[3],
+                            cfg_scale=cfg_scale,
+                            inference_steps=inference_steps,
+                            seed=seed,
+                            disable_voice_cloning=disable_voice_cloning,
+                            stability_preset=stability_preset
+                        )
+                        final_log = "🔀 Batched mode: " + batched_log
+                        # Return final WAV as complete audio (use gr.update to set visibility)
+                        # Log via logger (more reliable with Gradio workers)
+                        logger.info(f"Batched output written to: {complete_wav}")
+                        # Also write a small marker file in tmp so it's easy to inspect from the host
+                        try:
+                            marker_path = os.path.join(tempfile.gettempdir(), "vibevoice_last_batched.txt")
+                            with open(marker_path, "w", encoding="utf-8") as mf:
+                                mf.write(complete_wav + "\n")
+                            logger.info(f"Wrote marker file: {marker_path}")
+                        except Exception as _:
+                            logger.warning("Failed to write batched marker file")
+
+                        yield None, gr.update(value=complete_wav, visible=True), final_log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                    except Exception as e:
+                        error_msg = f"❌ Batched generation failed: {e}"
+                        print(error_msg)
+                        yield None, None, error_msg, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+                    return
 
                 for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
                     num_speakers=int(num_speakers),
@@ -912,7 +1425,8 @@ Or paste text directly and it will auto-assign speakers.""",
                     cfg_scale=cfg_scale,
                     inference_steps=inference_steps,
                     seed=seed,
-                    disable_voice_cloning=disable_voice_cloning
+                    disable_voice_cloning=disable_voice_cloning,
+                    stability_preset=stability_preset
                 ):
                     final_log = log
                     
@@ -958,9 +1472,9 @@ Or paste text directly and it will auto-assign speakers.""",
             inputs=[],
             outputs=[generate_btn, stop_btn],
             queue=False
-        ).then(
+            ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale, inference_steps, seed, disable_voice_cloning],
+            inputs=[num_speakers, script_input] + speaker_selections + [stability_preset, cfg_scale, inference_steps, seed, use_batched_mode, disable_voice_cloning],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
@@ -1004,14 +1518,6 @@ Or paste text directly and it will auto-assign speakers.""",
             
             # Default values if no examples
             return 2, ""
-        
-        # Connect random example button
-        random_example_btn.click(
-            fn=load_random_example,
-            inputs=[],
-            outputs=[num_speakers, script_input],
-            queue=False  # Don't queue this simple operation
-        )
         
         # Add usage tips
         gr.Markdown("""
@@ -1066,7 +1572,7 @@ def convert_to_16_bit_wav(data):
     # Normalize to range [-1, 1] if it's not already
     if np.max(np.abs(data)) > 1.0:
         data = data / np.max(np.abs(data))
-    
+
     # Scale to 16-bit integer range
     data = (data * 32767).astype(np.int16)
     return data
