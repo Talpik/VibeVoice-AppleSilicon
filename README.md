@@ -68,6 +68,29 @@ cd VibeVoice/
 uv pip install -e .
 ```
 
+---
+
+## Downloading the VibeVoice-7B model
+
+You can download the model files into `./models/VibeVoice-7B` using one of the following options:
+
+```bash
+# Recommended (no Git LFS required):
+uv run hf download vibevoice/VibeVoice-7B --local-dir ./models/VibeVoice-7B --repo-type model
+
+# Clone with git (requires git-lfs to fetch large files):
+# git lfs install
+# git clone https://huggingface.co/vibevoice/VibeVoice-7B ./models/VibeVoice-7B
+
+# Or via Python (huggingface_hub.snapshot_download):
+uv run python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download("vibevoice/VibeVoice-7B", cache_dir="./models/VibeVoice-7B")
+PY
+```
+
+> Note: If the model repo requires authentication, run `uv run hf login` or set `HF_TOKEN` as an environment variable. If you used `git clone`, ensure `git-lfs` is installed and enabled to fetch large model files.
+
 ## Usage
 
 ### 🚨 Tips
