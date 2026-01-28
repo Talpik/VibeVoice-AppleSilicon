@@ -786,29 +786,26 @@ class VibeVoiceDemo:
             if not parts:
                 parts = [content]
             for p in parts:
-                sentence_items.append((sid, f"{prefix}{p}"))
+                # Store raw sentence text; do NOT include the per-sentence speaker prefix.
+                # We'll prefix each batch once later to avoid introducing extra pauses.
+                sentence_items.append((sid, p))
 
         if not sentence_items:
             raise gr.Error("Error: No valid sentences to synthesize.")
 
         total_chars = sum(len(s) for _, s in sentence_items)
 
-        # Determine number of batches using requested test heuristics:
+        # Determine number of batches using conservative heuristics to avoid
+        # generating too many small chunks (larger batch counts can degrade speed):
         # - <=1000 chars -> 2 batches
         # - 1001..2500 chars -> 3 batches
-        # - 2501..3500 chars -> 4 batches
-        # - 3501..4000 chars -> 5 batches
-        # - >4000 chars -> 6 batches
+        # - >=2501 chars -> 4 batches
         if total_chars <= 1000:
             num_batches = 2
         elif total_chars <= 2500:
             num_batches = 3
-        elif total_chars <= 3500:
-            num_batches = 4
-        elif total_chars <= 4000:
-            num_batches = 5
         else:
-            num_batches = 6
+            num_batches = 4
 
         # Greedily group sentences into num_batches trying to balance character counts
         target_per_batch = max(1, total_chars // num_batches)
@@ -839,7 +836,15 @@ class VibeVoiceDemo:
         if not batches:
             batches = ["\n".join([s for _, s in sentence_items])]
 
-        texts = batches
+        # Attach a single speaker prefix per batch (avoid per-sentence speaker tags)
+        prefixed_texts: List[str] = []
+        for i, batch in enumerate(batches):
+            sid_for_batch = batch_voice_map[i] if i < len(batch_voice_map) else 0
+            # join sentences in the batch with spaces to form a natural paragraph
+            batch_body = " ".join(s.strip() for s in batch.split('\n') if s.strip())
+            prefixed_texts.append(f"Speaker {sid_for_batch}: {batch_body}")
+
+        texts = prefixed_texts
 
         # Log each batch text to terminal and to a marker file for offline analysis
         try:
@@ -1374,75 +1379,36 @@ Or paste text directly and it will auto-assign speakers.""",
                 if use_batched_mode:
                     start_message += " 🔀 Batched mode enabled — running non-streaming batched synthesis."
 
-                # If batched mode requested, run generation in a subprocess to isolate memory
+                # If batched mode requested, use non-streaming batched generation
                 if use_batched_mode:
                     try:
-                        inp = {
-                            'model_path': getattr(demo_instance, 'model_path', None),
-                            'device': getattr(demo_instance, 'device', 'cuda'),
-                            'adapter_path': getattr(demo_instance, 'adapter_path', None),
-                            'num_speakers': int(num_speakers),
-                            'script': script,
-                            'speaker_1': speakers[0],
-                            'speaker_2': speakers[1],
-                            'speaker_3': speakers[2],
-                            'speaker_4': speakers[3],
-                            'cfg_scale': cfg_scale,
-                            'inference_steps': inference_steps if inference_steps is not None else int(getattr(demo_instance, 'inference_steps', 10)),
-                            'seed': seed,
-                            'disable_voice_cloning': disable_voice_cloning,
-                            'stability_preset': stability_preset,
-                        }
-
-                        tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
-                        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix='.out.json')
+                        complete_wav, batched_log = demo_instance.generate_podcast_batched(
+                            num_speakers=int(num_speakers),
+                            script=script,
+                            speaker_1=speakers[0],
+                            speaker_2=speakers[1],
+                            speaker_3=speakers[2],
+                            speaker_4=speakers[3],
+                            cfg_scale=cfg_scale,
+                            inference_steps=inference_steps,
+                            seed=seed,
+                            disable_voice_cloning=disable_voice_cloning,
+                            stability_preset=stability_preset
+                        )
+                        final_log = "🔀 Batched mode: " + batched_log
+                        # Return final WAV as complete audio (use gr.update to set visibility)
+                        # Log via logger (more reliable with Gradio workers)
+                        logger.info(f"Batched output written to: {complete_wav}")
+                        # Also write a small marker file in tmp so it's easy to inspect from the host
                         try:
-                            tmp_in.write(json.dumps(inp).encode('utf-8'))
-                            tmp_in.flush()
-                            tmp_in.close()
-                            tmp_out.close()
+                            marker_path = os.path.join(tempfile.gettempdir(), "vibevoice_last_batched.txt")
+                            with open(marker_path, "w", encoding="utf-8") as mf:
+                                mf.write(complete_wav + "\n")
+                            logger.info(f"Wrote marker file: {marker_path}")
+                        except Exception as _:
+                            logger.warning("Failed to write batched marker file")
 
-                            runner = os.path.join(os.path.dirname(__file__), 'run_batched_subprocess.py')
-                            proc = subprocess.run([
-                                sys.executable,
-                                runner,
-                                tmp_in.name,
-                                tmp_out.name,
-                            ], capture_output=True, text=True, cwd=os.getcwd())
-
-                            try:
-                                with open(tmp_out.name, 'r', encoding='utf-8') as rf:
-                                    res = json.load(rf)
-                            except Exception as e:
-                                raise RuntimeError(f"Failed to read subprocess output: {e}\nproc.stderr={proc.stderr}")
-
-                            if 'error' in res:
-                                raise RuntimeError(res.get('error') or 'Unknown error in subprocess')
-
-                            complete_wav = res.get('out_path')
-                            batched_log = res.get('final_log', '')
-                            final_log = "🔀 Batched mode: " + batched_log
-
-                            try:
-                                marker_path = os.path.join(tempfile.gettempdir(), "vibevoice_last_batched.txt")
-                                with open(marker_path, "w", encoding="utf-8") as mf:
-                                    mf.write((complete_wav or '') + "\n")
-                                logger.info(f"Wrote marker file: {marker_path}")
-                            except Exception:
-                                logger.warning("Failed to write batched marker file")
-
-                            yield None, gr.update(value=complete_wav, visible=True), final_log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-
-                        finally:
-                            try:
-                                os.unlink(tmp_in.name)
-                            except Exception:
-                                pass
-                            try:
-                                os.unlink(tmp_out.name)
-                            except Exception:
-                                pass
-
+                        yield None, gr.update(value=complete_wav, visible=True), final_log, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
                     except Exception as e:
                         error_msg = f"❌ Batched generation failed: {e}"
                         print(error_msg)
